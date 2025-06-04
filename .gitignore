@@ -1,0 +1,5 @@
+*.out
+*.o
+*.h5
+prof_results/
+*.xdmf
