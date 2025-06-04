@@ -461,7 +461,47 @@ SWESolver::solve_step(const double dt,
   {
     for (std::size_t i = 1; i < nx_ - 1; ++i)
     {
-      this->compute_kernel(i, j, dt, h0, hu0, hv0, h, hu, hv);
+      const double dx = size_x_ / nx_;
+  const double dy = size_y_ / ny_;
+  const double C1x = 0.5 * dt / dx;
+  const double C1y = 0.5 * dt / dy;
+  const double C2 = dt * g;
+  constexpr double C3 = 0.5 * g;
+
+  double hij = 0.25 * (at(h0, i, j - 1) + at(h0, i, j + 1) + at(h0, i - 1, j) + at(h0, i + 1, j))
+               + C1x * (at(hu0, i - 1, j) - at(hu0, i + 1, j)) + C1y * (at(hv0, i, j - 1) - at(hv0, i, j + 1));
+  if (hij < 0.0)
+  {
+    hij = 1.0e-5;
+  }
+
+  at(h, i, j) = hij;
+
+  if (hij > 0.0001)
+  {
+    at(hu, i, j) =
+      0.25 * (at(hu0, i, j - 1) + at(hu0, i, j + 1) + at(hu0, i - 1, j) + at(hu0, i + 1, j)) - C2 * hij * at(zdx_, i, j)
+      + C1x
+          * (at(hu0, i - 1, j) * at(hu0, i - 1, j) / at(h0, i - 1, j) + C3 * at(h0, i - 1, j) * at(h0, i - 1, j)
+             - at(hu0, i + 1, j) * at(hu0, i + 1, j) / at(h0, i + 1, j) - C3 * at(h0, i + 1, j) * at(h0, i + 1, j))
+      + C1y
+          * (at(hu0, i, j - 1) * at(hv0, i, j - 1) / at(h0, i, j - 1)
+             - at(hu0, i, j + 1) * at(hv0, i, j + 1) / at(h0, i, j + 1));
+
+    at(hv, i, j) =
+      0.25 * (at(hv0, i, j - 1) + at(hv0, i, j + 1) + at(hv0, i - 1, j) + at(hv0, i + 1, j)) - C2 * hij * at(zdy_, i, j)
+      + C1x
+          * (at(hu0, i - 1, j) * at(hv0, i - 1, j) / at(h0, i - 1, j)
+             - at(hu0, i + 1, j) * at(hv0, i + 1, j) / at(h0, i + 1, j))
+      + C1y
+          * (at(hv0, i, j - 1) * at(hv0, i, j - 1) / at(h0, i, j - 1) + C3 * at(h0, i, j - 1) * at(h0, i, j - 1)
+             - at(hv0, i, j + 1) * at(hv0, i, j + 1) / at(h0, i, j + 1) - C3 * at(h0, i, j + 1) * at(h0, i, j + 1));
+  }
+  else
+  {
+    at(hu, i, j) = 0.0;
+    at(hv, i, j) = 0.0;
+  }
     }
   }
 }
