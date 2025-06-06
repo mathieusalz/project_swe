@@ -3,9 +3,15 @@
 #include <string>
 #include <cstddef>
 
+#include <mpi.h>
+
 int
-main()
+main(int argc, char **argv)
 {
+  MPI_Init(&argc, &argv);
+  int rank, nprocs;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
   // Uncomment the option you want to run.
 
   // Option 1 - Solving simple problem: water drops in a box
@@ -25,7 +31,7 @@ main()
   // const double Tend = 1.0;     // Simulation time in hours
   // const std::size_t nx = 1000; // Number of cells per direction.
   // const std::size_t ny = 1000; // Number of cells per direction.
-  // const std::size_t output_n = 10;
+  // const std::size_t output_n = 0;ls
   // const std::string output_fname = "analytical_tsunami";
   // const bool full_log = false;
 
@@ -49,5 +55,6 @@ main()
   // SWESolver solver(fname, size, size);
   // solver.solve(Tend, full_log, output_n, output_fname);
 
+  MPI_Finalize();
   return 0;
 }

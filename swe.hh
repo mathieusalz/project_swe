@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <vector>
 #include <string>
+#include <mpi.h>
 
 class SWESolver
 {
@@ -104,6 +105,23 @@ private:
   /**
    * @brief Accessor for 2D vector elements.
    */
+  inline double &at(double* arr, const std::size_t i, const std::size_t j) const
+  {
+    return arr[j * nx_ + i];
+  }
+
+  /**
+   * @brief Accessor for 2D vector elements.
+   * @note Constant vector version.
+   */
+  inline const double &at(const double* arr, const std::size_t i, const std::size_t j) const
+  {
+    return arr[j * nx_ + i];
+  }
+
+  /**
+   * @brief Accessor for 2D vector elements.
+   */
   inline double &at(std::vector<double> &vec, const std::size_t i, const std::size_t j) const
   {
     return vec[j * nx_ + i];
@@ -133,12 +151,12 @@ private:
   void compute_kernel(const std::size_t i,
                       const std::size_t j,
                       const double dt,
-                      const std::vector<double> &h0,
-                      const std::vector<double> &hu0,
-                      const std::vector<double> &hv0,
-                      std::vector<double> &h,
-                      std::vector<double> &hu,
-                      std::vector<double> &hv) const;
+                      const double* h0,
+                      const double* hu0,
+                      const double* hv0,
+                      double* h,
+                      double* hu,
+                      double* hv) const;
 
   /**
    * @brief Computes the time step size that satisfied the CFL condition.
@@ -150,11 +168,13 @@ private:
    * @param Tend Final time.
    * @return Compute time step.
    */
-  double compute_time_step(const std::vector<double> &h,
-                           const std::vector<double> &hu,
-                           const std::vector<double> &hv,
+  double compute_time_step(const double* h,
+                           const double* hu,
+                           const double* hv,
                            const double T,
-                           const double Tend) const;
+                           const double Tend,
+                           const int p_local_rows,
+                           const int prank) const;
 
   /**
    * @brief Solve one step of the SWE.
@@ -167,12 +187,14 @@ private:
    * @param hv The y water velocity in the current time step.
    */
   void solve_step(const double dt,
-                  const std::vector<double> &h0,
-                  const std::vector<double> &hu0,
-                  const std::vector<double> &hv0,
-                  std::vector<double> &h,
-                  std::vector<double> &hu,
-                  std::vector<double> &hv) const;
+                  const double* h0,
+                  const double* hu0,
+                  const double* hv0,
+                  double* h,
+                  double* hu,
+                  double* hv,
+                  const int p_local_rows, 
+                  const int prank) const;
 
   /**
    * @brief Update boundary conditions.
@@ -184,10 +206,46 @@ private:
    * @param hu The x water velocity in the current time step.
    * @param hv The y water velocity in the current time step.
    */
-  void update_bcs(const std::vector<double> &h0,
-                  const std::vector<double> &hu0,
-                  const std::vector<double> &hv0,
-                  std::vector<double> &h,
-                  std::vector<double> &hu,
-                  std::vector<double> &hv) const;
+  void update_bcs(const double* h0,
+                  const double* hu0,
+                  const double* hv0,
+                  double* h,
+                  double* hu,
+                  double* hv,
+                  const int p_local_rows,
+                  const int prank,
+                  const int psize) const;
+
+  void exchange_ghost_rows(double* local,
+                        int nx_,
+                        int p_local_rows,
+                        int prank,
+                        int psize,
+                        MPI_Comm comm) const;
+
+  void distribute_initial_data(double* h0_local,
+                               double* hu0_local,
+                               double* hv0_local,
+                               const std::vector<double> &h0,
+                               const std::vector<double> &hu0,
+                               const std::vector<double> &hv0,
+                               const int nx_,
+                               const int base_rows,
+                               const int rem,
+                               const int prank,
+                               const int psize,
+                               const int p_count) const;
+
+  void gather_fields_to_root(const double* h_local,
+        const double* hu_local,
+        const double* hv_local,
+        double* h_global,
+        double* hu_global,
+        double* hv_global,
+        const int nx,
+        const int psize,
+        const int base_rows,
+        const int rem,
+        const int p_local_rows,
+        const int p_extra_top) const;
 };

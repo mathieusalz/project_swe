@@ -8,6 +8,6 @@
 #SBATCH --mem=10G
 
 module purge
-module load intel intel-oneapi-mpi intel-oneapi-vtune hdf5
+module load gcc hdf5
 
-vtune -collect hotspots -r prof_results -- ./swe
+perf record ./swe
