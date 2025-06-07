@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --time=1:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=8
+#SBATCH --time=00:05:00
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
 #SBATCH --qos=math-454
 #SBATCH --account=math-454
-#SBATCH --mem=5G
+#SBATCH --mem=10G
 
 module purge
-module load gcc openmpi hdf5
+module load gcc cuda hdf5
 
 
 start_time=$(date +%s.%N)

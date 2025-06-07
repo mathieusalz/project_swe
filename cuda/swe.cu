@@ -285,8 +285,40 @@ SWESolver::init_dx_dy()
   }
 }
 
-    void
-    SWESolver::solve(const double Tend, const bool full_log, const std::size_t output_n, const std::string &fname_prefix)
+__global__ void kernel_timeStep(const double* h,
+                                  const double* hu,
+                                  const double* hv,
+                                  const int T,
+                                  const int Tend,
+                                  const std::size_t nx,
+                                  const std::size_t ny,
+                                  const double g,
+                                  double* block_results,
+                                  const double size_x_,
+                                  const double size_y_);
+
+__global__ void kernel_solveStep(const double* h0,
+                                const double* hu0,
+                                const double* hv0,
+                                const double dt,
+                                const std::size_t nx,
+                                const std::size_t ny,
+                                double* h,
+                                double* hu,
+                                double* hv,
+                                const double* zdx,
+                                const double* zdy,
+                                const double size_x, 
+                                const double size_y,
+                                const double g);
+
+__global__ void kernel_updateBCs(const double* h0, const double* hu0, const double* hv0,
+                                  double* h, double* hu, double* hv,
+                                  int nx, int ny, double coef);
+
+
+void
+SWESolver::solve(const double Tend, const bool full_log, const std::size_t output_n, const std::string &fname_prefix)
     {
     std::shared_ptr<XDMFWriter> writer;
     if (output_n > 0)
@@ -332,51 +364,58 @@ SWESolver::init_dx_dy()
 
     dim3 TPB(32, 32); 
     dim3 grid_inner(((nx_-2) + TPB.x - 1) / TPB.x, ((ny_-2) + TPB.y - 1) / TPB.y);
-    dim3 grid_total((nx_ + TPB.x - 1) / TPB.x, (ny_ + TPB.y - 1) / TPB.y);
-
-    dim3 grid_total = dim3((nx_ + TPB.x - 1) / TPB.x, (ny_ + TPB.y - 1) / TPB.y);
 
     const double coef = this->reflective_ ? -1.0 : 1.0;
-    const int total_boundary_elements = 2 * nx_ + 2 * ny_;
-
+    int num_blocks = grid_inner.x * grid_inner.y;
+    
     double *d_block_results, *d_final_result;
     cudaMalloc(&d_block_results, num_blocks * sizeof(double));
     cudaMalloc(&d_final_result, sizeof(double));
+    double* block_results;
+    block_results = (double*)malloc(num_blocks * sizeof(double));
+
+    const int total_boundary_elements = 2 * nx_ + 2 * ny_;
+    const int TBP_updateBCs = 256;
+    const int num_blocks_updateBCs = (total_boundary_elements + TBP_updateBCs - 1) / TBP_updateBCs;
 
     std::size_t nt = 1;
     while (T < Tend)
     {
         size_t shared_mem_size = TPB.x * TPB.y * sizeof(double);
         kernel_timeStep<<<grid_inner, TPB, shared_mem_size>>>(
-            d_h, d_hu, d_hv, d_block_results, nx_, ny_, g, dx, dy
-        );
+            d_h0, d_hu0, d_hv0, T, Tend, nx_, ny_, g, d_block_results, size_x_, size_y_);
 
-        int final_block_size = min(num_blocks, 256);
-        int final_grid_size = 1;
-
-        reduce_min_kernel<<<final_grid_size, final_block_size, final_block_size * sizeof(double)>>>(d_block_results, d_final_result, num_blocks);
-
-        double dt;
-        cudaMemcpy(&dt, d_final_result, sizeof(double), cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+        cudaMemcpy(block_results, d_block_results, num_blocks * sizeof(double), cudaMemcpyDeviceToHost);
+        double max_nu_sqr = 0.0;
+        for (int i = 0; i < num_blocks; i++) {
+            max_nu_sqr = std::max(max_nu_sqr, block_results[i]);
+        }
+      
+        printf("Max nu^2: %.4e\n", max_nu_sqr);
+        const double dx = size_x_ / nx_;
+        const double dy = size_y_ / ny_;
+        double dt = min(dx, dy) / sqrt(2.0 * max_nu_sqr);
+        dt = min(dt, Tend - T);
 
         const double T1 = T + dt;
 
         printf("Computing T: %2.4f hr  (dt = %.2e s) -- %3.3f%%", T1, dt * 3600, 100 * T1 / Tend);
         std::cout << (full_log ? "\n" : "\r") << std::flush;
 
-        kernel_updateBCs<<<1, total_boundary_elements>>>(d_h0, d_hu0, d_hv0, d_h, d_hu, d_hv, nx_, ny_, coef);
-
-        kernel_solveStep<<<grid_inner, TPB>>>(d_h0, d_hu0, d_hv0, dt, nx_, ny_, d_h, d_hu, d_hv, d_zdx, d_zdy);
+        kernel_updateBCs<<<num_blocks_updateBCs, TBP_updateBCs>>>(d_h0, d_hu0, d_hv0, d_h, d_hu, d_hv, nx_, ny_, coef);
+        cudaDeviceSynchronize();
+        kernel_solveStep<<<grid_inner, TPB>>>(d_h0, d_hu0, d_hv0, dt, nx_, ny_, d_h, d_hu, d_hv, d_zdx, d_zdy, size_x_, size_y_, g);
+        cudaDeviceSynchronize();
 
         if (output_n > 0 && nt % output_n == 0)
         {
-        cudaMemcpy(h.data(), d_h, h0.size() * sizeof(double), cudaMemcpyDeviceToHost);
-        writer->add_h(h, T1);
+          cudaMemcpy(h.data(), d_h, h0.size() * sizeof(double), cudaMemcpyDeviceToHost);
+          writer->add_h(h, T1);
         }
         ++nt;
 
         // Swap the old and new solutions
-
         std::swap(d_h0, d_h);
         std::swap(d_hu0, d_hu);
         std::swap(d_hv0, d_hv);
@@ -415,211 +454,122 @@ SWESolver::init_dx_dy()
   std::cout << "Finished solving SWE." << std::endl;
 }
 
-__global__ double kernel_timeStep(const double* h,
-                                  const double* hu,
-                                  const double* hv,
-                                  const int T,
-                                  const int Tend,
-                                  const std::size_t nx,
-                                  const std::size_t ny,
-                                  const double g,
-                                  double* block_results)
+__global__ void kernel_timeStep(const double* h,
+                              const double* hu,
+                              const double* hv,
+                              const int T,
+                              const int Tend,
+                              const std::size_t nx,
+                              const std::size_t ny,
+                              const double g,
+                              double* block_results,
+                              const double size_x_,
+                              const double size_y_)
 {
-
-  int threadIdx = blockIdx.x * blockDim.x + threadIdx.x;
-  int threadIdy = blockIdx.y * blockDim.y + threadIdx.y;
-
-
-  if (threadIdx >= nx || threadIdy >= ny || threadIdx == 0 || threadIdy == 0 || threadIdx == nx - 1 || threadIdy == ny - 1)
-  {
-    return 0.0; // Out of bounds
-  }
-
-  extern __shared__ double sdata[];
-
-  double max_nu_sqr = 0.0;
-  double au{0.0};
-  double av{0.0};
-
-  au = fmax(au, fabs(hu[threadIdx + threadIdy * nx]));
-  av = fmax(av, fabs(hv[threadIdx + threadIdy * nx]));
-  const double nu_u = fabs(hu[threadIdx + threadIdy * nx]) / h[threadIdx + threadIdy * nx] + sqrt(g * h[threadIdx + threadIdy * nx]);
-  const double nu_v = fabs(hv[threadIdx + threadIdy * nx]) / h[threadIdx + threadIdy * nx] + sqrt(g * h[threadIdx + threadIdy * nx]);
-  max_nu_sqr = fmax(max_nu_sqr, nu_u * nu_u + nu_v * nu_v);
+    int thread_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_y = blockIdx.y * blockDim.y + threadIdx.y;
     
-  const double dx = size_x_ / static_cast<double>(nx);
-  const double dy = size_y_ / static_cast<double>(ny);
+    extern __shared__ double sdata[];
+    
+    double max_nu_sqr = 0.0;
+    
+    // Check if thread is within the computation domain (matches your loop bounds)
+    if (thread_x >= 1 && thread_x < nx - 1 && thread_y >= 1 && thread_y < ny - 1) {
+        
+        int idx = thread_x + thread_y * nx;
+        
+        double hu_val = hu[idx];
+        double hv_val = hv[idx];
+        double h_val = h[idx];
 
-  int tid = threadIdx.x + threadIdx.y * blockDim.x;
-    sdata[tid] = local_dt;
+        const double nu_u = fabs(hu_val) / h_val + sqrt(g * h_val);
+        const double nu_v = fabs(hv_val) / h_val + sqrt(g * h_val);
+        
+        max_nu_sqr = fmax(max_nu_sqr, nu_u * nu_u + nu_v * nu_v);
+    } 
+    
+    int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    sdata[tid] = max_nu_sqr;
     __syncthreads();
-
-    // Block-level reduction to find minimum
+    
     for (int s = (blockDim.x * blockDim.y) / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            sdata[tid] = fmin(sdata[tid], sdata[tid + s]);
+            sdata[tid] = fmax(sdata[tid], sdata[tid + s]);  
         }
         __syncthreads();
     }
-
-    // Write block result
+    
     if (tid == 0) {
         block_results[blockIdx.x + blockIdx.y * gridDim.x] = sdata[0];
     }
 }
 
-__global__ void reduce_min_kernel(double* block_results, double* final_result, int num_blocks)
-{
-    extern __shared__ double sdata[];
-    
-    int tid = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Load data into shared memory
-    if (idx < num_blocks) {
-        sdata[tid] = block_results[idx];
-    } else {
-        sdata[tid] = DBL_MAX;
-    }
-    __syncthreads();
-    
-    // Reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] = fmin(sdata[tid], sdata[tid + s]);
-        }
-        __syncthreads();
-    }
-    
-    // Write result
-    if (tid == 0) {
-        *final_result = sdata[0];
-    }
-}
 
-double
-SWESolver::compute_time_step(const std::vector<double> &h,
-                             const std::vector<double> &hu,
-                             const std::vector<double> &hv,
-                             const double T,
-                             const double Tend) const
+__global__ void kernel_solveStep(const double* h0,
+                                const double* hu0,
+                                const double* hv0,
+                                const double dt,
+                                const std::size_t nx,
+                                const std::size_t ny,
+                                double* h,
+                                double* hu,
+                                double* hv,
+                                const double* zdx,
+                                const double* zdy,
+                                const double size_x, 
+                                const double size_y,
+                                const double g)       
 {
-  double max_nu_sqr = 0.0;
-  double au{0.0};
-  double av{0.0};
-  for (std::size_t j = 1; j < ny_ - 1; ++j)
-  {
-    for (std::size_t i = 1; i < nx_ - 1; ++i)
-    {
-      au = std::max(au, std::fabs(at(hu, i, j)));
-      av = std::max(av, std::fabs(at(hv, i, j)));
-      const double nu_u = std::fabs(at(hu, i, j)) / at(h, i, j) + sqrt(g * at(h, i, j));
-      const double nu_v = std::fabs(at(hv, i, j)) / at(h, i, j) + sqrt(g * at(h, i, j));
-      max_nu_sqr = std::max(max_nu_sqr, nu_u * nu_u + nu_v * nu_v);
-    }
+  int thread_x = blockIdx.x * blockDim.x + threadIdx.x;
+  int thread_y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (thread_x < 1 || thread_x >= nx - 1 || thread_y < 1 || thread_y >= ny - 1) {
+    return;
   }
 
-  const double dx = size_x_ / nx_;
-  const double dy = size_y_ / ny_;
-  double dt = std::min(dx, dy) / (sqrt(2.0 * max_nu_sqr));
-  return std::min(dt, Tend - T);
-}
-
-void
-SWESolver::compute_kernel(const std::size_t i,
-                          const std::size_t j,
-                          const double dt,
-                          const std::vector<double> &h0,
-                          const std::vector<double> &hu0,
-                          const std::vector<double> &hv0,
-                          std::vector<double> &h,
-                          std::vector<double> &hu,
-                          std::vector<double> &hv) const
-{
-  const double dx = size_x_ / nx_;
-  const double dy = size_y_ / ny_;
+  const double dx = size_x / nx;
+  const double dy = size_y / ny;
   const double C1x = 0.5 * dt / dx;
   const double C1y = 0.5 * dt / dy;
   const double C2 = dt * g;
-  constexpr double C3 = 0.5 * g;
+  const double C3 = 0.5 * g;
 
-  double hij = 0.25 * (at(h0, i, j - 1) + at(h0, i, j + 1) + at(h0, i - 1, j) + at(h0, i + 1, j))
-               + C1x * (at(hu0, i - 1, j) - at(hu0, i + 1, j)) + C1y * (at(hv0, i, j - 1) - at(hv0, i, j + 1));
-  if (hij < 0.0)
-  {
+  int idx = thread_x + thread_y * nx; 
+  int idx_l = (thread_x - 1) + thread_y * nx;
+  int idx_r = (thread_x + 1) + thread_y * nx;
+  int idx_t = thread_x + (thread_y + 1) * nx;
+  int idx_b = thread_x + (thread_y - 1) * nx;
+  
+  double hij = 0.25 * (h0[idx_b] + h0[idx_t] + h0[idx_r] + h0[idx_l])       
+               + C1x * (hu0[idx_l] - hu0[idx_r])     
+               + C1y * (hv0[idx_b] - hv0[idx_t]);    
+  
+  if (hij < 0.0) {
     hij = 1.0e-5;
   }
 
-  at(h, i, j) = hij;
+  h[idx] = hij;
 
-  if (hij > 0.0001)
-  {
-    at(hu, i, j) =
-      0.25 * (at(hu0, i, j - 1) + at(hu0, i, j + 1) + at(hu0, i - 1, j) + at(hu0, i + 1, j)) - C2 * hij * at(zdx_, i, j)
-      + C1x
-          * (at(hu0, i - 1, j) * at(hu0, i - 1, j) / at(h0, i - 1, j) + C3 * at(h0, i - 1, j) * at(h0, i - 1, j)
-             - at(hu0, i + 1, j) * at(hu0, i + 1, j) / at(h0, i + 1, j) - C3 * at(h0, i + 1, j) * at(h0, i + 1, j))
-      + C1y
-          * (at(hu0, i, j - 1) * at(hv0, i, j - 1) / at(h0, i, j - 1)
-             - at(hu0, i, j + 1) * at(hv0, i, j + 1) / at(h0, i, j + 1));
+  if (hij > 0.0001) {
+    hu[idx] = 
+      0.25 * (hu0[idx_b] + hu0[idx_t] + hu0[idx_l]  + hu0[idx_r])               
+      - C2 * hij * zdx[idx]                                      
+      + C1x * (hu0[idx_l] * hu0[idx_l] / h0[idx_l] + C3 * h0[idx_l] * h0[idx_l]
+             - hu0[idx_r] * hu0[idx_r] / h0[idx_r] - C3 * h0[idx_r] * h0[idx_r])
+      + C1y * (hu0[idx_b] * hv0[idx_b] / h0[idx_b]
+             - hu0[idx_t] * hv0[idx_t] / h0[idx_t]);
 
-    at(hv, i, j) =
-      0.25 * (at(hv0, i, j - 1) + at(hv0, i, j + 1) + at(hv0, i - 1, j) + at(hv0, i + 1, j)) - C2 * hij * at(zdy_, i, j)
-      + C1x
-          * (at(hu0, i - 1, j) * at(hv0, i - 1, j) / at(h0, i - 1, j)
-             - at(hu0, i + 1, j) * at(hv0, i + 1, j) / at(h0, i + 1, j))
-      + C1y
-          * (at(hv0, i, j - 1) * at(hv0, i, j - 1) / at(h0, i, j - 1) + C3 * at(h0, i, j - 1) * at(h0, i, j - 1)
-             - at(hv0, i, j + 1) * at(hv0, i, j + 1) / at(h0, i, j + 1) - C3 * at(h0, i, j + 1) * at(h0, i, j + 1));
+    hv[idx] = 
+      0.25 * (hv0[idx_b] + hv0[idx_t] + hv0[idx_l] + hv0[idx_r])              
+      - C2 * hij * zdy[idx]                                      
+      + C1x * (hu0[idx_l] * hv0[idx_l] / h0[idx_l]
+             - hu0[idx_r] * hv0[idx_r] / h0[idx_r])
+      + C1y * (hv0[idx_b] * hv0[idx_b] / h0[idx_b] + C3 * h0[idx_b] * h0[idx_b]
+             - hv0[idx_t] * hv0[idx_t] / h0[idx_t] - C3 * h0[idx_t] * h0[idx_t]);
+  } else {
+    hu[idx] = 0.0;
+    hv[idx] = 0.0;
   }
-  else
-  {
-    at(hu, i, j) = 0.0;
-    at(hv, i, j) = 0.0;
-  }
-
-}
-
-void
-SWESolver::solve_step(const double dt,
-                      const std::vector<double> &h0,
-                      const std::vector<double> &hu0,
-                      const std::vector<double> &hv0,
-                      std::vector<double> &h,
-                      std::vector<double> &hu,
-                      std::vector<double> &hv) const
-{
-  for (std::size_t j = 1; j < ny_ - 1; ++j)
-  {
-    for (std::size_t i = 1; i < nx_ - 1; ++i)
-    {
-      this->compute_kernel(i, j, dt, h0, hu0, hv0, h, hu, hv);
-    }
-  }
-}
-
-__global__ kernel_solveStep(const double* h0,
-                                  const double* hu0,
-                                  const double* hv0,
-                                  const double dt,
-                                  const std::size_t nx,
-                                  const std::size_t ny,
-                                  double* h,
-                                  double* hu,
-                                  double* hv,
-                                  const double* zdx,
-                                  const double* zdy)
-{
-  int threadIdx = blockIdx.x * blockDim.x + threadIdx.x;
-  int threadIdy = blockIdx.y * blockDim.y + threadIdx.y;
-
-  if (threadIdx >= nx || threadIdy >= ny || threadIdx == 0 || threadIdy == 0 || threadIdx == nx - 1 || threadIdy == ny - 1)
-  {
-    return 0.0; // Out of bounds
-  }
-
-  // Call the compute_kernel function for each thread
-  compute_kernel(threadIdx, threadIdy, dt, h0, hu0, hv0, h, hu, hv, zdx, zdy);
 }
 
 
@@ -635,81 +585,44 @@ __global__ void kernel_updateBCs(const double* h0, const double* hu0, const doub
     
     // Determine which boundary this thread handles
     if (idx < nx) {
-        // Top boundary (j = 0)
+        // Top boundary 
         int i = idx;
-        int src_idx = i * ny + 1;        // (i, 1)
-        int dst_idx = i * ny + 0;        // (i, 0)
+        int src_idx = i + 1;        
+        int dst_idx = i + 0;        
         
         h[dst_idx] = h0[src_idx];
-        hu[dst_idx] = hu0[src_idx];
+        hu[dst_idx] = hu0[src_idx];      
         hv[dst_idx] = coef * hv0[src_idx];
         
     } else if (idx < 2 * nx) {
-        // Bottom boundary (j = ny-1)
+        // Bottom boundary 
         int i = idx - nx;
-        int src_idx = i * ny + (ny - 2);  // (i, ny-2)
-        int dst_idx = i * ny + (ny - 1);  // (i, ny-1)
+        int src_idx = i + (ny - 2) * nx;  
+        int dst_idx = i + (ny - 1) * nx;  
         
         h[dst_idx] = h0[src_idx];
-        hu[dst_idx] = hu0[src_idx];
-        hv[dst_idx] = coef * hv0[src_idx];
+        hu[dst_idx] = hu0[src_idx];       
+        hv[dst_idx] = coef * hv0[src_idx]; 
         
     } else if (idx < 2 * nx + ny) {
-        // Left boundary (i = 0)
+        // Left boundary 
         int j = idx - 2 * nx;
-        int src_idx = 1 * ny + j;         // (1, j)
-        int dst_idx = 0 * ny + j;         // (0, j)
+        int src_idx = 1 + j * nx;         
+        int dst_idx = 0 + j * nx;         
         
         h[dst_idx] = h0[src_idx];
-        hu[dst_idx] = hu0[src_idx];
-        hv[dst_idx] = coef * hv0[src_idx];
+        hu[dst_idx] = coef * hu0[src_idx]; 
+        hv[dst_idx] = hv0[src_idx];        
         
     } else {
-        // Right boundary (i = nx-1)
+        // Right boundary 
         int j = idx - 2 * nx - ny;
-        int src_idx = (nx - 2) * ny + j;  // (nx-2, j)
-        int dst_idx = (nx - 1) * ny + j;  // (nx-1, j)
-        
+        int src_idx = (nx - 2) + j * nx;  
+        int dst_idx = (nx - 1) + j * nx;  
+
         h[dst_idx] = h0[src_idx];
-        hu[dst_idx] = hu0[src_idx];
-        hv[dst_idx] = coef * hv0[src_idx];
+        hu[dst_idx] = coef * hu0[src_idx]; 
+        hv[dst_idx] = hv0[src_idx];
     }
 }
-
-
-void
-SWESolver::update_bcs(const std::vector<double> &h0,
-                      const std::vector<double> &hu0,
-                      const std::vector<double> &hv0,
-                      std::vector<double> &h,
-                      std::vector<double> &hu,
-                      std::vector<double> &hv) const
-{
-  const double coef = this->reflective_ ? -1.0 : 1.0;
-
-  // Top and bottom boundaries.
-  for (std::size_t i = 0; i < nx_; ++i)
-  {
-    at(h, i, 0) = at(h0, i, 1);
-    at(h, i, ny_ - 1) = at(h0, i, ny_ - 2);
-
-    at(hu, i, 0) = at(hu0, i, 1);
-    at(hu, i, ny_ - 1) = at(hu0, i, ny_ - 2);
-
-    at(hv, i, 0) = coef * at(hv0, i, 1);
-    at(hv, i, ny_ - 1) = coef * at(hv0, i, ny_ - 2);
-  }
-
-  // Left and right boundaries.
-  for (std::size_t j = 0; j < ny_; ++j)
-  {
-    at(h, 0, j) = at(h0, 1, j);
-    at(h, nx_ - 1, j) = at(h0, nx_ - 2, j);
-
-    at(hu, 0, j) = coef * at(hu0, 1, j);
-    at(hu, nx_ - 1, j) = coef * at(hu0, nx_ - 2, j);
-
-    at(hv, 0, j) = at(hv0, 1, j);
-    at(hv, nx_ - 1, j) = at(hv0, nx_ - 2, j);
-  }
-};
+;

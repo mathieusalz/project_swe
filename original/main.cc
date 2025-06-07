@@ -6,7 +6,7 @@
 #include <iostream>
 
 int
-main(int argc, char **argv)
+main()
 {
 
   // Uncomment the option you want to run.
@@ -14,8 +14,8 @@ main(int argc, char **argv)
   // Option 1 - Solving simple problem: water drops in a box
   const int test_case_id = 1;  // Water drops in a box
   const double Tend = 1.0;     // Simulation time in hours
-  const std::size_t nx = 100; // Number of cells per direction.
-  const std::size_t ny = 100; // Number of cells per direction.
+  const std::size_t nx = 1000; // Number of cells per direction.
+  const std::size_t ny = 1000; // Number of cells per direction.
   const std::size_t output_n = 0;
   const std::string output_fname = "water_drops";
   const bool full_log = false;

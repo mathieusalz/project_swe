@@ -10,4 +10,4 @@
 module purge
 module load gcc hdf5
 
-perf record ./swe
+srun ./swe

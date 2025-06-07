@@ -190,4 +190,5 @@ private:
                   std::vector<double> &h,
                   std::vector<double> &hu,
                   std::vector<double> &hv) const;
+
 };
