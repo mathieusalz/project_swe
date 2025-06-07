@@ -316,6 +316,7 @@ __global__ void kernel_updateBCs(const double* h0, const double* hu0, const doub
                                   double* h, double* hu, double* hv,
                                   int nx, int ny, double coef);
 
+__global__ void reduce_max_kernel(double* input, double* output, int n);
 
 void
 SWESolver::solve(const double Tend, const bool full_log, const std::size_t output_n, const std::string &fname_prefix)
@@ -368,11 +369,10 @@ SWESolver::solve(const double Tend, const bool full_log, const std::size_t outpu
     const double coef = this->reflective_ ? -1.0 : 1.0;
     int num_blocks = grid_inner.x * grid_inner.y;
     
-    double *d_block_results, *d_final_result;
+    double *d_block_results, *d_final_result, *d_temp_results; 
     cudaMalloc(&d_block_results, num_blocks * sizeof(double));
+    cudaMalloc(&d_temp_results, num_blocks * sizeof(double));
     cudaMalloc(&d_final_result, sizeof(double));
-    double* block_results;
-    block_results = (double*)malloc(num_blocks * sizeof(double));
 
     const int total_boundary_elements = 2 * nx_ + 2 * ny_;
     const int TBP_updateBCs = 256;
@@ -385,12 +385,31 @@ SWESolver::solve(const double Tend, const bool full_log, const std::size_t outpu
         kernel_timeStep<<<grid_inner, TPB, shared_mem_size>>>(
             d_h0, d_hu0, d_hv0, T, Tend, nx_, ny_, g, d_block_results, size_x_, size_y_);
 
-        cudaDeviceSynchronize();
-        cudaMemcpy(block_results, d_block_results, num_blocks * sizeof(double), cudaMemcpyDeviceToHost);
-        double max_nu_sqr = 0.0;
-        for (int i = 0; i < num_blocks; i++) {
-            max_nu_sqr = std::max(max_nu_sqr, block_results[i]);
+        double *tobe_reduced = d_block_results;
+        double *reduced = d_temp_results;
+        int current_size = num_blocks;
+        
+        while (current_size > 1) {
+            int threads_per_block = 256;  // Must be power of 2
+            int blocks_needed = (current_size + threads_per_block - 1) / threads_per_block;
+            
+            reduce_max_kernel<<<blocks_needed, threads_per_block, 
+                              threads_per_block * sizeof(double)>>>(
+                tobe_reduced, reduced, current_size);
+            
+            // Swap pointers for next iteration
+            std::swap(tobe_reduced, reduced);
+            current_size = blocks_needed;
         }
+        
+        double max_nu_sqr;
+        cudaMemcpy(&max_nu_sqr, tobe_reduced, sizeof(double), cudaMemcpyDeviceToHost);
+        // cudaDeviceSynchronize();
+        // cudaMemcpy(block_results, d_block_results, num_blocks * sizeof(double), cudaMemcpyDeviceToHost);
+        // double max_nu_sqr = 0.0;
+        // for (int i = 0; i < num_blocks; i++) {
+        //     max_nu_sqr = std::max(max_nu_sqr, block_results[i]);
+        // }
       
         printf("Max nu^2: %.4e\n", max_nu_sqr);
         const double dx = size_x_ / nx_;
@@ -504,7 +523,29 @@ __global__ void kernel_timeStep(const double* h,
     }
 }
 
-
+__global__ void reduce_max_kernel(double* input, double* output, int n) {
+    extern __shared__ double sdata[];
+    
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Load data into shared memory (handle out-of-bounds with -infinity for max)
+    sdata[tid] = (i < n) ? input[i] : -INFINITY;
+    __syncthreads();
+    
+    // Standard reduction loop
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmax(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+    
+    // Write result for this block
+    if (tid == 0) {
+        output[blockIdx.x] = sdata[0];
+    }
+}
 __global__ void kernel_solveStep(const double* h0,
                                 const double* hu0,
                                 const double* hv0,
