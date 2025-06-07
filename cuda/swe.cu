@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cmath>
 #include <memory>
+#include <cuda_runtime.h>
+
 
 namespace
 {
@@ -283,55 +285,108 @@ SWESolver::init_dx_dy()
   }
 }
 
-void
-SWESolver::solve(const double Tend, const bool full_log, const std::size_t output_n, const std::string &fname_prefix)
-{
-  std::shared_ptr<XDMFWriter> writer;
-  if (output_n > 0)
-  {
+    void
+    SWESolver::solve(const double Tend, const bool full_log, const std::size_t output_n, const std::string &fname_prefix)
+    {
+    std::shared_ptr<XDMFWriter> writer;
+    if (output_n > 0)
+    {
     writer = std::make_shared<XDMFWriter>(fname_prefix, this->nx_, this->ny_, this->size_x_, this->size_y_, this->z_);
     writer->add_h(h0_, 0.0);
-  }
-
-  double T = 0.0;
-
-  std::vector<double> &h = h1_;
-  std::vector<double> &hu = hu1_;
-  std::vector<double> &hv = hv1_;
-
-  std::vector<double> &h0 = h0_;
-  std::vector<double> &hu0 = hu0_;
-  std::vector<double> &hv0 = hv0_;
-
-  std::cout << "Solving SWE..." << std::endl;
-
-  std::size_t nt = 1;
-  while (T < Tend)
-  {
-    const double dt = this->compute_time_step(h0, hu0, hv0, T, Tend);
-
-    const double T1 = T + dt;
-
-    printf("Computing T: %2.4f hr  (dt = %.2e s) -- %3.3f%%", T1, dt * 3600, 100 * T1 / Tend);
-    std::cout << (full_log ? "\n" : "\r") << std::flush;
-
-    this->update_bcs(h0, hu0, hv0, h, hu, hv);
-
-    this->solve_step(dt, h0, hu0, hv0, h, hu, hv);
-
-    if (output_n > 0 && nt % output_n == 0)
-    {
-      writer->add_h(h, T1);
     }
-    ++nt;
 
-    // Swap the old and new solutions
-    std::swap(h, h0);
-    std::swap(hu, hu0);
-    std::swap(hv, hv0);
+    double T = 0.0;
 
-    T = T1;
-  }
+    std::vector<double> &h = h1_;
+    std::vector<double> &hu = hu1_;
+    std::vector<double> &hv = hv1_;
+    std::vector<double> &h0 = h0_;
+    std::vector<double> &hu0 = hu0_;
+    std::vector<double> &hv0 = hv0_;
+
+    double* d_h = nullptr;
+    double* d_hu = nullptr;
+    double* d_hv = nullptr;
+    double* d_h0 = nullptr;
+    double* d_hu0 = nullptr;
+    double* d_hv0 = nullptr;
+    double* d_zdx = nullptr;
+    double* d_zdy = nullptr;
+
+    cudaMalloc(&d_h, h.size() * sizeof(double));
+    cudaMalloc(&d_hu, hu.size() * sizeof(double));
+    cudaMalloc(&d_hv, hv.size() * sizeof(double));
+    cudaMalloc(&d_h0, h0.size() * sizeof(double));
+    cudaMalloc(&d_hu0, hu0.size() * sizeof(double));
+    cudaMalloc(&d_hv0, hv0.size() * sizeof(double));
+    cudaMalloc(&d_zdx, zdx_.size() * sizeof(double));
+    cudaMalloc(&d_zdy, zdy_.size() * sizeof(double));
+
+    cudaMemcpy(d_h0, h0.data(), h0.size() * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hu0, hu0.data(), hu0.size() * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hv0, hv0.data(), hv0.size() * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_zdx, zdx_.data(), zdx_.size() * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_zdy, zdy_.data(), zdy_.size() * sizeof(double), cudaMemcpyHostToDevice);
+
+    std::cout << "Solving SWE..." << std::endl;
+
+    dim3 TPB(32, 32); 
+    dim3 grid_inner(((nx_-2) + TPB.x - 1) / TPB.x, ((ny_-2) + TPB.y - 1) / TPB.y);
+    dim3 grid_total((nx_ + TPB.x - 1) / TPB.x, (ny_ + TPB.y - 1) / TPB.y);
+
+    dim3 grid_total = dim3((nx_ + TPB.x - 1) / TPB.x, (ny_ + TPB.y - 1) / TPB.y);
+
+    const double coef = this->reflective_ ? -1.0 : 1.0;
+    const int total_boundary_elements = 2 * nx_ + 2 * ny_;
+
+    double *d_block_results, *d_final_result;
+    cudaMalloc(&d_block_results, num_blocks * sizeof(double));
+    cudaMalloc(&d_final_result, sizeof(double));
+
+    std::size_t nt = 1;
+    while (T < Tend)
+    {
+        size_t shared_mem_size = TPB.x * TPB.y * sizeof(double);
+        kernel_timeStep<<<grid_inner, TPB, shared_mem_size>>>(
+            d_h, d_hu, d_hv, d_block_results, nx_, ny_, g, dx, dy
+        );
+
+        int final_block_size = min(num_blocks, 256);
+        int final_grid_size = 1;
+
+        reduce_min_kernel<<<final_grid_size, final_block_size, final_block_size * sizeof(double)>>>(d_block_results, d_final_result, num_blocks);
+
+        double dt;
+        cudaMemcpy(&dt, d_final_result, sizeof(double), cudaMemcpyDeviceToHost);
+
+        const double T1 = T + dt;
+
+        printf("Computing T: %2.4f hr  (dt = %.2e s) -- %3.3f%%", T1, dt * 3600, 100 * T1 / Tend);
+        std::cout << (full_log ? "\n" : "\r") << std::flush;
+
+        kernel_updateBCs<<<1, total_boundary_elements>>>(d_h0, d_hu0, d_hv0, d_h, d_hu, d_hv, nx_, ny_, coef);
+
+        kernel_solveStep<<<grid_inner, TPB>>>(d_h0, d_hu0, d_hv0, dt, nx_, ny_, d_h, d_hu, d_hv, d_zdx, d_zdy);
+
+        if (output_n > 0 && nt % output_n == 0)
+        {
+        cudaMemcpy(h.data(), d_h, h0.size() * sizeof(double), cudaMemcpyDeviceToHost);
+        writer->add_h(h, T1);
+        }
+        ++nt;
+
+        // Swap the old and new solutions
+
+        std::swap(d_h0, d_h);
+        std::swap(d_hu0, d_hu);
+        std::swap(d_hv0, d_hv);
+
+        T = T1;
+    }
+
+  cudaMemcpy(h0.data(), d_h0, h0.size() * sizeof(double), cudaMemcpyDeviceToHost);
+  cudaMemcpy(hu0.data(), d_hu0, h0.size() * sizeof(double), cudaMemcpyDeviceToHost);
+  cudaMemcpy(hv0.data(), d_hv0, h0.size() * sizeof(double), cudaMemcpyDeviceToHost);
 
   // Copying last computed values to h1_, hu1_, hv1_ (if needed)
   if (&h0 != &h1_)
@@ -341,12 +396,105 @@ SWESolver::solve(const double Tend, const bool full_log, const std::size_t outpu
     hv1_ = hv0;
   }
 
+  cudaFree(d_h);
+  cudaFree(d_hu);
+  cudaFree(d_hv);
+  cudaFree(d_h0);
+  cudaFree(d_hu0);
+  cudaFree(d_hv0);
+  cudaFree(d_zdx);
+  cudaFree(d_zdy);
+  cudaFree(d_block_results);
+  cudaFree(d_final_result);
+
   if (output_n > 0)
   {
     writer->add_h(h1_, T);
   }
 
   std::cout << "Finished solving SWE." << std::endl;
+}
+
+__global__ double kernel_timeStep(const double* h,
+                                  const double* hu,
+                                  const double* hv,
+                                  const int T,
+                                  const int Tend,
+                                  const std::size_t nx,
+                                  const std::size_t ny,
+                                  const double g,
+                                  double* block_results)
+{
+
+  int threadIdx = blockIdx.x * blockDim.x + threadIdx.x;
+  int threadIdy = blockIdx.y * blockDim.y + threadIdx.y;
+
+
+  if (threadIdx >= nx || threadIdy >= ny || threadIdx == 0 || threadIdy == 0 || threadIdx == nx - 1 || threadIdy == ny - 1)
+  {
+    return 0.0; // Out of bounds
+  }
+
+  extern __shared__ double sdata[];
+
+  double max_nu_sqr = 0.0;
+  double au{0.0};
+  double av{0.0};
+
+  au = fmax(au, fabs(hu[threadIdx + threadIdy * nx]));
+  av = fmax(av, fabs(hv[threadIdx + threadIdy * nx]));
+  const double nu_u = fabs(hu[threadIdx + threadIdy * nx]) / h[threadIdx + threadIdy * nx] + sqrt(g * h[threadIdx + threadIdy * nx]);
+  const double nu_v = fabs(hv[threadIdx + threadIdy * nx]) / h[threadIdx + threadIdy * nx] + sqrt(g * h[threadIdx + threadIdy * nx]);
+  max_nu_sqr = fmax(max_nu_sqr, nu_u * nu_u + nu_v * nu_v);
+    
+  const double dx = size_x_ / static_cast<double>(nx);
+  const double dy = size_y_ / static_cast<double>(ny);
+
+  int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    sdata[tid] = local_dt;
+    __syncthreads();
+
+    // Block-level reduction to find minimum
+    for (int s = (blockDim.x * blockDim.y) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmin(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Write block result
+    if (tid == 0) {
+        block_results[blockIdx.x + blockIdx.y * gridDim.x] = sdata[0];
+    }
+}
+
+__global__ void reduce_min_kernel(double* block_results, double* final_result, int num_blocks)
+{
+    extern __shared__ double sdata[];
+    
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Load data into shared memory
+    if (idx < num_blocks) {
+        sdata[tid] = block_results[idx];
+    } else {
+        sdata[tid] = DBL_MAX;
+    }
+    __syncthreads();
+    
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmin(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+    
+    // Write result
+    if (tid == 0) {
+        *final_result = sdata[0];
+    }
 }
 
 double
@@ -430,22 +578,6 @@ SWESolver::compute_kernel(const std::size_t i,
     at(hv, i, j) = 0.0;
   }
 
-  // h(2:nx-1,2:nx-1) = 0.25*(h0(2:nx-1,1:nx-2)+h0(2:nx-1,3:nx)+h0(1:nx-2,2:nx-1)+h0(3:nx,2:nx-1)) ...
-  //     + C1*( hu0(2:nx-1,1:nx-2) - hu0(2:nx-1,3:nx) + hv0(1:nx-2,2:nx-1) - hvhv0:nx,2:nx-1) );
-
-  // hu(2:nx-1,2:nx-1) = 0.25*(hu0(2:nx-1,1:nx-2)+hu0(2:nx-1,3:nx)+hu0(1:nx-2,2:nx-1)+hu0(3:nx,2:nx-1)) -
-  // C2*H(2:nx-1,2:nx-1).*Zdx(2:nx-1,2:nx-1) ...
-  //     + C1*( hu0(2:nx-1,1:nx-2).^2./h0(2:nx-1,1:nx-2) + 0.5*g*h0(2:nx-1,1:nx-2).^2 -
-  //     hu0(2:nx-1,3:nx).^2./h0(2:nx-1,3:nx) - 0.5*g*h0(2:nx-1,3:nx).^2 ) ...
-  //     + C1*( hu0(1:nx-2,2:nx-1).*hv0(1:nx-2,2:nx-1)./h0(1:nx-2,2:nx-1) -
-  //     hu0(3:nx,2:nx-1).*hv0(3:nx,2:nx-1)./h0(3:nx,2:nx-1) );
-
-  // hv(2:nx-1,2:nx-1) = 0.25*(hv0(2:nx-1,1:nx-2)+hv0(2:nx-1,3:nx)+hv0(1:nx-2,2:nx-1)+hv0(3:nx,2:nx-1)) -
-  // C2*H(2:nx-1,2:nx-1).*Zdy(2:nx-1,2:nx-1)  ...
-  //     + C1*( hu0(2:nx-1,1:nx-2).*hv0(2:nx-1,1:nx-2)./h0(2:nx-1,1:nx-2) -
-  //     hu0(2:nx-1,3:nx).*hv0(2:nx-1,3:nx)./h0(2:nx-1,3:nx) ) ...
-  //     + C1*( hv0(1:nx-2,2:nx-1).^2./h0(1:nx-2,2:nx-1) + 0.5*g*h0(1:nx-2,2:nx-1).^2 -
-  //     hv0(3:nx,2:nx-1).^2./h0(3:nx,2:nx-1) - 0.5*g*h0(3:nx,2:nx-1).^2  );
 }
 
 void
@@ -465,6 +597,85 @@ SWESolver::solve_step(const double dt,
     }
   }
 }
+
+__global__ kernel_solveStep(const double* h0,
+                                  const double* hu0,
+                                  const double* hv0,
+                                  const double dt,
+                                  const std::size_t nx,
+                                  const std::size_t ny,
+                                  double* h,
+                                  double* hu,
+                                  double* hv,
+                                  const double* zdx,
+                                  const double* zdy)
+{
+  int threadIdx = blockIdx.x * blockDim.x + threadIdx.x;
+  int threadIdy = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (threadIdx >= nx || threadIdy >= ny || threadIdx == 0 || threadIdy == 0 || threadIdx == nx - 1 || threadIdy == ny - 1)
+  {
+    return 0.0; // Out of bounds
+  }
+
+  // Call the compute_kernel function for each thread
+  compute_kernel(threadIdx, threadIdy, dt, h0, hu0, hv0, h, hu, hv, zdx, zdy);
+}
+
+
+__global__ void kernel_updateBCs(const double* h0, const double* hu0, const double* hv0,
+                                  double* h, double* hu, double* hv,
+                                  int nx, int ny, double coef) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Total boundary elements: 2*nx (top/bottom) + 2*ny (left/right)
+    int total_boundary_elements = 2 * nx + 2 * ny;
+    
+    if (idx >= total_boundary_elements) return;
+    
+    // Determine which boundary this thread handles
+    if (idx < nx) {
+        // Top boundary (j = 0)
+        int i = idx;
+        int src_idx = i * ny + 1;        // (i, 1)
+        int dst_idx = i * ny + 0;        // (i, 0)
+        
+        h[dst_idx] = h0[src_idx];
+        hu[dst_idx] = hu0[src_idx];
+        hv[dst_idx] = coef * hv0[src_idx];
+        
+    } else if (idx < 2 * nx) {
+        // Bottom boundary (j = ny-1)
+        int i = idx - nx;
+        int src_idx = i * ny + (ny - 2);  // (i, ny-2)
+        int dst_idx = i * ny + (ny - 1);  // (i, ny-1)
+        
+        h[dst_idx] = h0[src_idx];
+        hu[dst_idx] = hu0[src_idx];
+        hv[dst_idx] = coef * hv0[src_idx];
+        
+    } else if (idx < 2 * nx + ny) {
+        // Left boundary (i = 0)
+        int j = idx - 2 * nx;
+        int src_idx = 1 * ny + j;         // (1, j)
+        int dst_idx = 0 * ny + j;         // (0, j)
+        
+        h[dst_idx] = h0[src_idx];
+        hu[dst_idx] = hu0[src_idx];
+        hv[dst_idx] = coef * hv0[src_idx];
+        
+    } else {
+        // Right boundary (i = nx-1)
+        int j = idx - 2 * nx - ny;
+        int src_idx = (nx - 2) * ny + j;  // (nx-2, j)
+        int dst_idx = (nx - 1) * ny + j;  // (nx-1, j)
+        
+        h[dst_idx] = h0[src_idx];
+        hu[dst_idx] = hu0[src_idx];
+        hv[dst_idx] = coef * hv0[src_idx];
+    }
+}
+
 
 void
 SWESolver::update_bcs(const std::vector<double> &h0,
