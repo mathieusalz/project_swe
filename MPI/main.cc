@@ -20,28 +20,28 @@ main(int argc, char **argv)
   // Uncomment the option you want to run.
 
   // Option 1 - Solving simple problem: water drops in a box
-  const int test_case_id = 1;  // Water drops in a box
-  const double Tend = 1.0;     // Simulation time in hours
-  const std::size_t nx = 100; // Number of cells per direction.
-  const std::size_t ny = 100; // Number of cells per direction.
-  const std::size_t output_n = 0;
-  const std::string output_fname = "water_drops";
-  const bool full_log = false;
-
-  SWESolver solver(test_case_id, nx, ny);
-  solver.solve(Tend, full_log, output_n, output_fname);
-
-  // // Option 2 - Solving analytical (dummy) tsunami example.
-  // const int test_case_id = 2;  // Analytical tsunami test case
+  // const int test_case_id = 1;  // Water drops in a box
   // const double Tend = 1.0;     // Simulation time in hours
   // const std::size_t nx = 1000; // Number of cells per direction.
   // const std::size_t ny = 1000; // Number of cells per direction.
-  // const std::size_t output_n = 0;ls
-  // const std::string output_fname = "analytical_tsunami";
+  // const std::size_t output_n = 0;
+  // const std::string output_fname = "water_drops";
   // const bool full_log = false;
 
   // SWESolver solver(test_case_id, nx, ny);
   // solver.solve(Tend, full_log, output_n, output_fname);
+
+  // // Option 2 - Solving analytical (dummy) tsunami example.
+  const int test_case_id = 2;  // Analytical tsunami test case
+  const double Tend = 1.0;     // Simulation time in hours
+  const std::size_t nx = 1000; // Number of cells per direction.
+  const std::size_t ny = 1000; // Number of cells per direction.
+  const std::size_t output_n = 0;
+  const std::string output_fname = "analytical_tsunami";
+  const bool full_log = false;
+
+  SWESolver solver(test_case_id, nx, ny);
+  solver.solve(Tend, full_log, output_n, output_fname);
 
   // // Option 3 - Solving tsunami problem with data loaded from file.
   // const double Tend = 0.2;   // Simulation time in hours

@@ -371,7 +371,6 @@ SWESolver::compute_time_step(const std::vector<double> &h,
     }
   }
 
-  printf("Max_nu_sqr = %.6e\n", max_nu_sqr);
   const double dx = size_x_ / nx_;
   const double dy = size_y_ / ny_;
   double dt = std::min(dx, dy) / (sqrt(2.0 * max_nu_sqr));

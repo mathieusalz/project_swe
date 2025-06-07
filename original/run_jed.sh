@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --time=1:00:00
-#SBATCH --nodes=2
-#SBATCH --ntasks=64
+#SBATCH --time=4:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --qos=math-454
 #SBATCH --account=math-454
-#SBATCH --mem=10G
+#SBATCH --mem=5G
 
 module purge
-module load gcc openmpi hdf5
+module load gcc hdf5
 
 
 start_time=$(date +%s.%N)

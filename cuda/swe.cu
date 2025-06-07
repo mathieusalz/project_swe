@@ -404,14 +404,7 @@ SWESolver::solve(const double Tend, const bool full_log, const std::size_t outpu
         
         double max_nu_sqr;
         cudaMemcpy(&max_nu_sqr, tobe_reduced, sizeof(double), cudaMemcpyDeviceToHost);
-        // cudaDeviceSynchronize();
-        // cudaMemcpy(block_results, d_block_results, num_blocks * sizeof(double), cudaMemcpyDeviceToHost);
-        // double max_nu_sqr = 0.0;
-        // for (int i = 0; i < num_blocks; i++) {
-        //     max_nu_sqr = std::max(max_nu_sqr, block_results[i]);
-        // }
       
-        printf("Max nu^2: %.4e\n", max_nu_sqr);
         const double dx = size_x_ / nx_;
         const double dy = size_y_ / ny_;
         double dt = min(dx, dy) / sqrt(2.0 * max_nu_sqr);
